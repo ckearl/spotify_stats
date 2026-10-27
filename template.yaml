@@ -461,9 +461,9 @@ Resources:
       EndpointConfiguration:
         Type: REGIONAL
       MethodSettings:
-        # Slow down password guessing on the dashboard data endpoint
-        - ResourcePath: /~1dashboard-data
-          HttpMethod: GET
+        # Every endpoint checks the same password, so every one is slowed down against guessing.
+        - ResourcePath: "/*"
+          HttpMethod: "*"
           ThrottlingRateLimit: 2
           ThrottlingBurstLimit: 5
 
