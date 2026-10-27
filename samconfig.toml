@@ -1,0 +1,14 @@
+version = 0.1
+
+[default.deploy.parameters]
+stack_name = "spotify-tracker"
+resolve_s3 = true
+s3_prefix = "spotify-tracker"
+confirm_changeset = true
+capabilities = "CAPABILITY_IAM"
+disable_rollback = true
+parameter_overrides = "UserTimezone=\"America/Denver\" LogLevel=\"INFO\""
+image_repositories = []
+
+[default.global.parameters]
+region = "us-west-2"

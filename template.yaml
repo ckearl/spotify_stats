@@ -1,0 +1,553 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Spotify Listening History Tracker — tracks every Spotify listen with
+  rich metadata, session grouping, device tracking, and manual tagging.
+
+# =========================================================================
+# Parameters
+# =========================================================================
+Parameters:
+  SpotifyClientId:
+    Type: String
+    Description: Spotify app client ID
+    NoEcho: true
+  SpotifyClientSecret:
+    Type: String
+    Description: Spotify app client secret
+    NoEcho: true
+  SpotifyRefreshToken:
+    Type: String
+    Description: Spotify OAuth refresh token
+    NoEcho: true
+  UserTimezone:
+    Type: String
+    Default: America/Denver
+    Description: IANA timezone for schedule matching and new-day calculations
+  LogLevel:
+    Type: String
+    Default: INFO
+    AllowedValues: [DEBUG, INFO, WARNING, ERROR]
+  DomainName:
+    Type: String
+    Description: Custom domain name for the API (from .env via scripts/deploy.sh)
+  HostedZoneId:
+    Type: String
+    Description: Route 53 hosted zone ID for the domain (from .env via scripts/deploy.sh)
+  DashboardPasswordHash:
+    Type: String
+    NoEcho: true
+    Description: SHA-256 hex of the dashboard password (from .env via scripts/deploy.sh)
+
+# =========================================================================
+# Globals — shared settings for all Lambda functions
+# =========================================================================
+Globals:
+  Function:
+    Runtime: python3.11
+    MemorySize: 128
+    Architectures:
+      - arm64  # Graviton2 — cheaper and faster for Python
+    Environment:
+      Variables:
+        SPOTIFY_CLIENT_ID: !Ref SpotifyClientId
+        SPOTIFY_CLIENT_SECRET: !Ref SpotifyClientSecret
+        SPOTIFY_REFRESH_TOKEN: !Ref SpotifyRefreshToken
+        USER_TIMEZONE: !Ref UserTimezone
+        LOG_LEVEL: !Ref LogLevel
+        DYNAMODB_REGION: !Ref AWS::Region
+        TABLE_TRACKS: !Ref TracksTable
+        TABLE_LISTENS: !Ref ListensTable
+        TABLE_DEVICE_HISTORY: !Ref DeviceHistoryTable
+        TABLE_DEVICE_MAPPINGS: !Ref DeviceMappingsTable
+        TABLE_PLAYBACK_STATE: !Ref PlaybackStateTable
+        DASHBOARD_BUCKET: !Ref DashboardBucket
+        # Every API endpoint checks the X-Dashboard-Password header against this (utils/auth.py).
+        DASHBOARD_PASSWORD_HASH: !Ref DashboardPasswordHash
+
+# =========================================================================
+# Resources
+# =========================================================================
+Resources:
+
+  # -----------------------------------------------------------------------
+  # DynamoDB Tables
+  # -----------------------------------------------------------------------
+
+  TracksTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: SpotifyTracks
+      BillingMode: PROVISIONED
+      ProvisionedThroughput:
+        ReadCapacityUnits: 5
+        WriteCapacityUnits: 5
+      AttributeDefinitions:
+        - AttributeName: track_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: track_id
+          KeyType: HASH
+
+  ListensTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: SpotifyListens
+      BillingMode: PROVISIONED
+      ProvisionedThroughput:
+        ReadCapacityUnits: 5
+        WriteCapacityUnits: 5
+      AttributeDefinitions:
+        - AttributeName: listen_id
+          AttributeType: S
+        - AttributeName: track_id
+          AttributeType: S
+        - AttributeName: played_at
+          AttributeType: S
+        - AttributeName: session_id
+          AttributeType: S
+        - AttributeName: partition_key
+          AttributeType: S
+      KeySchema:
+        - AttributeName: listen_id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        # GSI 1: Deduplication — check if track+timestamp already exists
+        - IndexName: TrackPlayedAtIndex
+          KeySchema:
+            - AttributeName: track_id
+              KeyType: HASH
+            - AttributeName: played_at
+              KeyType: RANGE
+          Projection:
+            ProjectionType: KEYS_ONLY
+          ProvisionedThroughput:
+            ReadCapacityUnits: 2
+            WriteCapacityUnits: 2
+        # GSI 2: Session queries — tag-session endpoint
+        - IndexName: SessionIndex
+          KeySchema:
+            - AttributeName: session_id
+              KeyType: HASH
+            - AttributeName: played_at
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+          ProvisionedThroughput:
+            ReadCapacityUnits: 1
+            WriteCapacityUnits: 2
+        # GSI 3: Time-range queries — tag-range, stats, recent listens
+        - IndexName: PlayedAtIndex
+          KeySchema:
+            - AttributeName: partition_key
+              KeyType: HASH
+            - AttributeName: played_at
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+          ProvisionedThroughput:
+            ReadCapacityUnits: 2
+            WriteCapacityUnits: 2
+
+  DeviceHistoryTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: SpotifyDeviceHistory
+      BillingMode: PROVISIONED
+      ProvisionedThroughput:
+        ReadCapacityUnits: 2
+        WriteCapacityUnits: 2
+      AttributeDefinitions:
+        - AttributeName: device_key
+          AttributeType: S
+        - AttributeName: timestamp
+          AttributeType: S
+      KeySchema:
+        - AttributeName: device_key
+          KeyType: HASH
+        - AttributeName: timestamp
+          KeyType: RANGE
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+
+  DeviceMappingsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: SpotifyDeviceMappings
+      BillingMode: PROVISIONED
+      ProvisionedThroughput:
+        ReadCapacityUnits: 1
+        WriteCapacityUnits: 1
+      AttributeDefinitions:
+        - AttributeName: spotify_device_name
+          AttributeType: S
+      KeySchema:
+        - AttributeName: spotify_device_name
+          KeyType: HASH
+
+  # One item: the play the poller is currently following between runs.
+  PlaybackStateTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: SpotifyPlaybackState
+      BillingMode: PROVISIONED
+      ProvisionedThroughput:
+        ReadCapacityUnits: 1
+        WriteCapacityUnits: 1
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+
+  # -----------------------------------------------------------------------
+  # Lambda Functions
+  # -----------------------------------------------------------------------
+
+  SyncFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: spotify-sync
+      Handler: lambda_handlers/sync_handler.handler
+      Timeout: 60
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TracksTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ListensTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref DeviceHistoryTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref DeviceMappingsTable
+        - S3CrudPolicy:
+            BucketName: !Ref DashboardBucket
+      Events:
+        Schedule:
+          Type: Schedule
+          Properties:
+            Schedule: rate(90 minutes)
+            Description: Sync recently played tracks every 90 minutes
+            Enabled: true
+        Api:
+          Type: Api
+          Properties:
+            Path: /sync
+            Method: POST
+            RestApiId: !Ref SpotifyApi
+
+  DeviceTrackerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: spotify-device-tracker
+      Handler: lambda_handlers/device_tracker_handler.handler
+      Timeout: 30
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref DeviceHistoryTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref DeviceMappingsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref PlaybackStateTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ListensTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TracksTable
+        - S3CrudPolicy:
+            BucketName: !Ref DashboardBucket
+      Events:
+        Schedule:
+          Type: Schedule
+          Properties:
+            Schedule: rate(1 minute)
+            Description: Poll the player every minute to log plays recently-played misses (librespot clients)
+            Enabled: true
+
+  TagListenFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: spotify-tag-listen
+      Handler: lambda_handlers/tag_listen_handler.handler
+      Timeout: 10
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ListensTable
+      Events:
+        Api:
+          Type: Api
+          Properties:
+            Path: /tag-listen
+            Method: POST
+            RestApiId: !Ref SpotifyApi
+
+  TagSessionFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: spotify-tag-session
+      Handler: lambda_handlers/tag_session_handler.handler
+      Timeout: 10
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ListensTable
+      Events:
+        Api:
+          Type: Api
+          Properties:
+            Path: /tag-session
+            Method: POST
+            RestApiId: !Ref SpotifyApi
+
+  TagRangeFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: spotify-tag-range
+      Handler: lambda_handlers/tag_range_handler.handler
+      Timeout: 10
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ListensTable
+      Events:
+        Api:
+          Type: Api
+          Properties:
+            Path: /tag-range
+            Method: POST
+            RestApiId: !Ref SpotifyApi
+
+  MapDeviceFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: spotify-map-device
+      Handler: lambda_handlers/map_device_handler.handler
+      Timeout: 10
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref DeviceMappingsTable
+      Events:
+        Api:
+          Type: Api
+          Properties:
+            Path: /map-device
+            Method: POST
+            RestApiId: !Ref SpotifyApi
+
+  StatsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: spotify-stats
+      Handler: lambda_handlers/stats_handler.handler
+      Timeout: 15
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ListensTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TracksTable
+      Events:
+        Api:
+          Type: Api
+          Properties:
+            Path: /stats
+            Method: GET
+            RestApiId: !Ref SpotifyApi
+
+  IphoneWidgetFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: spotify-iphone-widget
+      Handler: lambda_handlers/iphone_widget_handler.handler
+      Timeout: 15
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ListensTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TracksTable
+      Events:
+        Api:
+          Type: Api
+          Properties:
+            Path: /iphone-widget
+            Method: GET
+            RestApiId: !Ref SpotifyApi
+
+  DashboardDataFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: spotify-dashboard-data
+      Handler: lambda_handlers/dashboard_data_handler.handler
+      Timeout: 60
+      MemorySize: 512
+      Environment:
+        Variables:
+          DASHBOARD_BUCKET: !Ref DashboardBucket
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref ListensTable
+        - DynamoDBReadPolicy:
+            TableName: !Ref TracksTable
+        - S3CrudPolicy:
+            BucketName: !Ref DashboardBucket
+      Events:
+        DailyRebuild:
+          Type: Schedule
+          Properties:
+            Schedule: rate(1 day)
+            Description: Full snapshot rebuild; appends keep it current in between
+            Input: '{"rebuild": true}'
+        Api:
+          Type: Api
+          Properties:
+            Path: /dashboard-data
+            Method: GET
+            RestApiId: !Ref SpotifyApi
+
+  DashboardPageFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: spotify-dashboard-page
+      Handler: lambda_handlers/dashboard_page_handler.handler
+      Timeout: 10
+      MemorySize: 512
+      Environment:
+        Variables:
+          DASHBOARD_BUCKET: !Ref DashboardBucket
+      Policies:
+        - S3ReadPolicy:
+            BucketName: !Ref DashboardBucket
+      Events:
+        Root:
+          Type: Api
+          Properties:
+            Path: /dashboard
+            Method: GET
+            RestApiId: !Ref SpotifyApi
+        Proxy:
+          Type: Api
+          Properties:
+            Path: /dashboard/{proxy+}
+            Method: GET
+            RestApiId: !Ref SpotifyApi
+
+  # -----------------------------------------------------------------------
+  # Dashboard storage — site/index.html (the app) and data/snapshot.json
+  # -----------------------------------------------------------------------
+
+  DashboardBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      CorsConfiguration:
+        CorsRules:
+          - AllowedMethods: [GET]
+            AllowedOrigins:
+              - !Sub https://${DomainName}
+              - http://localhost:5173
+            MaxAge: 3600
+
+  # -----------------------------------------------------------------------
+  # API Gateway
+  # -----------------------------------------------------------------------
+
+  SpotifyApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: SpotifyTrackerAPI
+      StageName: prod
+      Description: Spotify Listening History Tracker API
+      EndpointConfiguration:
+        Type: REGIONAL
+      MethodSettings:
+        # Slow down password guessing on the dashboard data endpoint
+        - ResourcePath: /~1dashboard-data
+          HttpMethod: GET
+          ThrottlingRateLimit: 2
+          ThrottlingBurstLimit: 5
+
+  # -----------------------------------------------------------------------
+  # Custom Domain (Regional — cert in same region, no CloudFront needed)
+  # -----------------------------------------------------------------------
+
+  # DNS-validated via Route 53 — CloudFormation creates the validation
+  # record and waits for the cert to be ISSUED before continuing.
+  SpotifyStatsCertificate:
+    Type: AWS::CertificateManager::Certificate
+    Properties:
+      DomainName: !Ref DomainName
+      ValidationMethod: DNS
+      DomainValidationOptions:
+        - DomainName: !Ref DomainName
+          HostedZoneId: !Ref HostedZoneId
+
+  SpotifyStatsDomain:
+    Type: AWS::ApiGateway::DomainName
+    Properties:
+      DomainName: !Ref DomainName
+      RegionalCertificateArn: !Ref SpotifyStatsCertificate
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+
+  ApiBasePathMapping:
+    Type: AWS::ApiGateway::BasePathMapping
+    DependsOn:
+      - SpotifyApiprodStage
+    Properties:
+      DomainName: !Ref SpotifyStatsDomain
+      RestApiId: !Ref SpotifyApi
+      Stage: prod
+
+  DnsRecord:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Ref DomainName
+      Type: A
+      AliasTarget:
+        DNSName: !GetAtt SpotifyStatsDomain.RegionalDomainName
+        HostedZoneId: !GetAtt SpotifyStatsDomain.RegionalHostedZoneId
+
+
+# =========================================================================
+# Outputs
+# =========================================================================
+Outputs:
+  ApiEndpoint:
+    Description: API Gateway endpoint URL
+    Value: !Sub https://${SpotifyApi}.execute-api.${AWS::Region}.amazonaws.com/prod
+
+  SyncEndpoint:
+    Description: Manual sync trigger URL
+    Value: !Sub https://${SpotifyApi}.execute-api.${AWS::Region}.amazonaws.com/prod/sync
+
+  StatsEndpoint:
+    Description: Stats query URL
+    Value: !Sub https://${SpotifyApi}.execute-api.${AWS::Region}.amazonaws.com/prod/stats
+
+  IphoneWidgetEndpoint:
+    Description: iPhone widget data URL
+    Value: !Sub https://${SpotifyApi}.execute-api.${AWS::Region}.amazonaws.com/prod/iphone-widget
+
+  CustomDomainEndpoint:
+    Description: Custom domain API base URL
+    Value: !Sub https://${DomainName}
+
+  DashboardUrl:
+    Description: Listening dashboard
+    Value: !Sub https://${DomainName}/dashboard
+
+  DashboardBucketName:
+    Description: Bucket holding the dashboard page and data snapshot
+    Value: !Ref DashboardBucket
+
+  TracksTableArn:
+    Value: !GetAtt TracksTable.Arn
+  ListensTableArn:
+    Value: !GetAtt ListensTable.Arn
+  DeviceHistoryTableArn:
+    Value: !GetAtt DeviceHistoryTable.Arn
+  DeviceMappingsTableArn:
+    Value: !GetAtt DeviceMappingsTable.Arn
